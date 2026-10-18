@@ -18,7 +18,8 @@ public:
         {
             std::lock_guard<std::mutex> lk(mtx);
             q.push(std::move(v));
-        }
+        } 
+        // release the lock first, and then notify_one()
         not_empty.notify_one();
     }
     
@@ -40,5 +41,12 @@ public:
         }
         not_empty.notify_all();
     }
-};
+
+    bool is_empty() {
+        return q.empty();
+    }
     
+    bool is_closed() {
+        return closed;
+    }
+};
