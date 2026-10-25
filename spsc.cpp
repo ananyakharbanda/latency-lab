@@ -3,51 +3,56 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <cstddef>
 
-template<typename T, int Size>
+template<typename T, std::size_t Size>
 class SPSC {
 private:
-    std::array<T, Size> c_queue;
-    alignas(64) std::atomic<int> w_pos{0};
-    alignas(64) std::atomic<int> r_pos{0};
+    static_assert(Size > 0 && (Size & (Size - 1)) == 0, "Size must be a power of 2");
+    static constexpr std::size_t mask = Size - 1;
+
+    alignas(64) std::array<T, Size> c_queue;
+
+    alignas(64) std::atomic<std::size_t> w_pos{0};
+    std::size_t cached_r{0};
+
+    alignas(64) std::atomic<std::size_t> r_pos{0};
+    std::size_t cached_w{0};
     
-    int next(int curr) {
-        if (curr == Size - 1) {
-            return 0;   
-        } else {
-            return curr + 1;
-        }
-    }
-            
-    
+
 public:
     SPSC() {}
         
     bool push(const T& obj) {
-        int w = w_pos.load(std::memory_order_relaxed);
-        int n = next(w);
-        if (n != r_pos.load(std::memory_order_acquire)) {
-            c_queue[w] = obj;
-            w_pos.store(n, std::memory_order_release);
-            return true;
+        std::size_t w = w_pos.load(std::memory_order_relaxed);
+        if (w - cached_r == Size) {
+            cached_r = r_pos.load(std::memory_order_acquire);
+            if (w - cached_r == Size) {
+                return false;
+            }
         }
-        return false;
+        c_queue[w & mask] = obj;
+        w_pos.store(w + 1, std::memory_order_release);
+        return true;
     }
     
     std::optional<T> pop() {
-        int r = r_pos.load(std::memory_order_relaxed);
-        if (r != w_pos.load(std::memory_order_acquire)) { 
-            T obj = std::move(c_queue[r]);
-            r_pos.store(next(r_pos), std::memory_order_release);
-            return obj;
+        std::size_t r = r_pos.load(std::memory_order_relaxed);
+        if (r == cached_w) { 
+            cached_w = w_pos.load(std::memory_order_acquire);
+            if (r == cached_w) {
+                return std::nullopt;
+            }
         }
-        return std::nullopt;
+        T obj = std::move(c_queue[r & mask]);
+        r_pos.store(r + 1, std::memory_order_release);
+        return obj;
     }
 };
 
 
 int main() {
-    SPSC<int, 20> q;
+    SPSC<int, 32> q;
     const int N = 1'000'000;
     
     std::thread producer([&] {
