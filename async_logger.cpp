@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <cstddef>
 #include <type_traits>
+#include <ctime>
+#include <algorithm>
+#include <memory>
+#include <cstdio>
+#include <cstring>
+#include <charconv>
 #include "spsc.h"
 
 enum class Level : uint8_t {
@@ -44,19 +50,12 @@ static_assert(std::is_trivially_copyable_v<LogRecord>, "LogRecord must be memcpy
 
 class Logger {
 private:
-    SPSC<LogRecord, 2**16> q_;
+    SPSC<LogRecord, 1 << 14> q_;
     
     static int64_t now_ticks() {
-        std::chrono::duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
     
-    // template<typename T, typename... Args>
-    // static void encode_args(LogRecord& rec, const T& head, const Args&... args) {
-    //     encode(rec, head);
-    //     encode_args(rec, args);
-    // }
-    
-
     template<typename... Args>
     static void encode_args(LogRecord& rec, const Args&... args) {
         (encode(rec, args) && ...);
@@ -120,7 +119,7 @@ private:
         
     static bool encode(LogRecord& rec, std::string_view v) {
         std::size_t room = LogRecord::PayloadSize - rec.hdr.payload_len - 3;
-        uint16_6 len = static_cast<uint16_t>(std::min(v.size(), room));
+        uint16_t len = static_cast<uint16_t>(std::min(v.size(), room));
         
         rec.payload[rec.hdr.payload_len] = std::byte{static_cast<uint8_t>(Arg_Type::String)};
         rec.hdr.payload_len += 1;
@@ -136,33 +135,150 @@ private:
     }
     
     void run() {
-        if (running_) {
-            while(LogRecord r = q_.pop()) {
-                format_record(r);
+        while (running_.load(std::memory_order_acquire)) {
+            std::optional<LogRecord> r = q_.pop();
+            if (r.has_value()) {
+                format_record(r.value());
+                flush_buffer();
+            }
+        }
+        
+        while (true) {
+            std::optional<LogRecord> r = q_.pop();
+            if (!r.has_value()) break;
+            format_record(r.value());
+            flush_buffer();
+        }
+    }
+
+
+    static std::string_view level_name(Level lvl) {
+        switch(lvl) {
+            case Level::Debug: return "DEBUG";
+            case Level::Info: return "INFO";
+            case Level::Warn: return "WARN";
+            case Level::Error: return "ERROR";
+        }
+        return "?????";
+    }  
+    
+    void format_record(const LogRecord& rec) {
+        line_len_ = 0;
+            
+        append_timestamp(rec.hdr.timestamp);
+        append(" ");
+        append(level_name(rec.hdr.level));
+        append(" ");
+
+        std::string_view fmt(rec.hdr.format);
+        std::size_t pos = 0;
+        int args_left = rec.hdr.arg_count;
+        
+        for (std::size_t i = 0; i < fmt.size(); i++) {
+            bool is_placeholder = (fmt[i] == '{' && i + 1 < fmt.size() && fmt[i + 1] == '}');
+            
+            if (is_placeholder) {
+                if (args_left > 0) {
+                    append_arg(rec, pos);
+                    args_left -= 1;
+                } else {
+                    append("{}");
+                } 
+                i++;
+            } else {
+                append(fmt.substr(i, 1));
+            }
+        }
+        
+        line_[line_len_] = '\n';
+        line_len_ += 1;
+    }
+                
+    void append_timestamp(int64_t ticks) {
+        std::time_t seconds = static_cast<std::time_t>(ticks / 1'000'000'000);
+        long micros = static_cast<long>((ticks % 1'000'000'000) / 1'000);
+        
+        std::tm tm;
+        localtime_r(&seconds, &tm);
+        
+        char buf[40];
+        int n = std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06ld", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, micros);
+        append(std::string_view(buf, n));
+    }
+
+    template<typename T>
+    void append_number(T v) {
+        char buf[32];
+        std::to_chars_result result = std::to_chars(buf, buf + sizeof(buf), v);
+        std::size_t length = result.ptr - buf;
+        append(std::string_view(buf, length));
+    } 
+    
+    void append_arg(const LogRecord& rec, std::size_t& pos) {
+        Arg_Type type = static_cast<Arg_Type>(rec.payload[pos]);
+        pos += 1;
+        
+        switch (type) {
+            case Arg_Type::Int32: {
+                int32_t v;
+                std::memcpy(&v, &rec.payload[pos], sizeof(v));
+                pos += sizeof(v);
+                append_number(v);
+                break;  
+            }
+            case Arg_Type::Int64: {
+                int64_t v;
+                std::memcpy(&v, &rec.payload[pos], sizeof(v));
+                pos += sizeof(v);
+                append_number(v);
+                break;  
+            }
+            case Arg_Type::UInt64: {
+                uint64_t v;
+                std::memcpy(&v, &rec.payload[pos], sizeof(v));
+                pos += sizeof(v);
+                append_number(v);
+                break;  
+            }
+            case Arg_Type::Double: {
+                double v;
+                std::memcpy(&v, &rec.payload[pos], sizeof(v));
+                pos += sizeof(v);
+                append_number(v);
+                break;  
+            }
+            case Arg_Type::Char: {
+                char c;
+                std::memcpy(&c, &rec.payload[pos], sizeof(c));
+                pos += sizeof(c);
+                append(std::string_view(&c, 1));
+                break;
+            }
+            case Arg_Type::String: {
+                uint16_t len;
+                std::memcpy(&len, &rec.payload[pos], sizeof(len));
+                pos += sizeof(len);
+                
+                const char* chars = reinterpret_cast<const char*>(&rec.payload[pos]);
+                append(std::string_view(chars, len));
+                pos += len;
+                break;
             }
         }
     }
     
-    void format_record(const LogRecord& rec) {
-        memcpy(line_, std::to_char(rec.timestamp), 64);
-        line_ += 64;
-        strcpy(line_, rec.format);
-        line_ += strlen(rec.format);
-        memcpy(line_, std::to_char(rec.payload_len), 64);
-        line_ += 64;
-        memcpy(line_, std::to_char(rec.arg_count), 8);
-        line_ += 8;
-        memcpy(line_, std::to_char(rec.level), 8);
-        line_ += 8;
-        
-    }
-        
     
-     
-    void append_timestamp(int64_t ticks);
-    const std::byte* append_arg(const std::byte* p);
-    void append(std::string_view s);
-    void flush_buffer();
+    void append(std::string_view s) {
+        std::size_t room = sizeof(line_) - 1 - line_len_;
+        std::size_t n = std::min(s.size(), room);
+        std::memcpy(&line_[line_len_], s.data(), n);
+        line_len_ += n;
+    } 
+        
+    void flush_buffer() {
+        std::fwrite(line_, 1, line_len_, file_);
+        std::fflush(file_);
+    };
     
     std::atomic<bool> running_{false};
     std::atomic<Level> level_{Level::Info};
@@ -170,40 +286,83 @@ private:
 
     std::thread worker_;
     std::string path_;
-    File* file_ = nullptr;
+    FILE* file_ = nullptr;
     char line_[1024];
     std::size_t line_len_ = 0;
 
 
 public:
     explicit Logger(const std::string& file_path) {
-        file_ = fopen(file_path.c_str(), "wa");
+        file_ = std::fopen(file_path.c_str(), "w");
     }
         
-    ~Logger() {}; 
+    ~Logger() {
+        stop();
+        if (file_ != nullptr) std::fclose(file_);     
+    } 
     
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
     
     void init() {
-        worker_.run(run);
-        worker_.join();     
-        running_ = true;
+        running_.store(true, std::memory_order_release);
+        worker_ = std::thread(&Logger::run, this);
     }
 
     void stop() {
-        running_ = false;
+        bool was_running = running_.exchange(false);
+        if (!was_running) return;
+        worker_.join();
     } 
     
     template<typename... Args>    
-    void log(Level lvl, const char* format, const Args&... args);
+    void log(Level lvl, const char* format, const Args&... args) {
+        if (lvl < level_.load(std::memory_order_relaxed)) return;
+        
+        LogRecord rec;
+        rec.hdr.timestamp = now_ticks();    
+        rec.hdr.format = format;
+        rec.hdr.payload_len = 0;
+        rec.hdr.arg_count = 0;
+        rec.hdr.level = lvl;
     
-    void set_level(Level lvl);
+        encode_args(rec, args...);
+        
+        bool pushed = q_.push(rec);
+        if (!pushed) {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     
-    Level level() const;
+    void set_level(Level lvl) {
+        level_.store(lvl, std::memory_order_relaxed);
+    }
+    
+    Level level() const {
+        return level_.load(std::memory_order_relaxed);
+    }
 
-    uint64_t dropped_count() const;
+    uint64_t dropped_count() const {
+        return dropped_.load(std::memory_order_relaxed);
+    }
 };
+
+int main() {
+    Logger lg("app.log");
+    lg.init();
+
+    std::string user = "ananya";
+    lg.log(Level::Info, "order {} sym {} qty {} px {} side {} by {}",
+           1001, "AAPL", 500, 189.25, 'B', std::string_view(user));
+    lg.log(Level::Debug, "this is filtered out {}", 1);
+    lg.log(Level::Warn, "big number {}", static_cast<int64_t>(123456789012345));
+
+    for (int i = 0; i < 10'000; ++i)
+        lg.log(Level::Info, "tick {} price {}", i, 100.0 + i * 0.01);
+
+    lg.stop();
+    std::cout << "dropped: " << lg.dropped_count() << "\n";
+}
 
 
 
